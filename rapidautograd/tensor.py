@@ -1,14 +1,7 @@
 import numpy as np
 import pyopencl as cl
-import os
-import warnings
-
 from rapidautograd.memorypool import MemoryPool
-
-warnings.filterwarnings("ignore")
-
-os.environ['PYOPENCL_COMPILER_OUTPUT'] = '1'
-os.environ["PYOPENCL_CTX"] = "0"
+from rapidautograd.kernels import add_program, subtract_program, matmul_program, multiply_program, context, queue
 
 memory_pool = MemoryPool()
 
@@ -17,158 +10,197 @@ class Tensor:
         self.data = np.array(data, dtype=np.float32)
         if self.data.size % 4 != 0:
             padding = 4 - self.data.size % 4
-            self.data = np.pad(self.data, (0, padding), 'constant', constant_values=(0,)) 
+            self.data = np.pad(self.data, (0, padding), 'constant', constant_values=(0,))
         self.requires_grad = requires_grad
         self.grad = None
-        self._grad_fn = None
-
-    def set_grad_fn(self, grad_fn):
-        self._grad_fn = grad_fn
+        self.creator = None
 
     def backward(self, grad=None):
-        if self.requires_grad:
-            if grad is None and self.grad is None:
-                self.grad = np.ones_like(self.data)
-            elif grad is not None:
-                if self.grad is None:
-                    self.grad = grad
-                else:
-                    self.grad += grad
+        if not self.requires_grad:
+            return
+        if grad is None:
+            grad = np.ones_like(self.data)
+        if self.grad is None:
+            self.grad = grad
+        else:
+            self.grad += grad
 
-            if self._grad_fn is not None:
-                self._grad_fn(self.grad)
+        if self.creator:
+            self.creator.backward(grad)
 
     def zero_grad(self):
         self.grad = None
 
     def __repr__(self):
-        return f'RapidTensor(data={self.data}, grad={self.grad})'
+        return f'Tensor(data={self.data}, grad={self.grad})'
 
-##################### 
-### Kernels
-#####################
-# Initialize OpenCL context and queue
-context = cl.create_some_context()
-queue = cl.CommandQueue(context)
+    def add(self, other):
+        return add(self, other)
 
-add_kernel_code = """
-__kernel void add_kernel(__global const float4 *a, __global const float4 *b, __global float4 *c, int num_elements) {
-    int idx = get_global_id(0);
-    if (idx < num_elements) {
-        c[idx] = a[idx] + b[idx];
-    }
-}
-"""
+    def multiply(self, other):
+        return multiply(self, other)
 
-multiply_kernel_code = """
-__kernel void multiply_kernel(__global const float4 *a, __global const float4 *b, __global float4 *c, int num_elements) {
-    int idx = get_global_id(0);
-    if (idx < num_elements) {
-        c[idx] = a[idx] * b[idx];
-    }
-}
-"""
+    def subtract(self, other):
+        return subtract(self, other)
 
-subtract_kernel_code = """
-__kernel void subtract_kernel(__global const float4 *a, __global const float4 *b, __global float4 *c, int num_elements) {
-    int idx = get_global_id(0);
-    if (idx < num_elements) {
-        c[idx] = a[idx] - b[idx];
-    }
-}
-"""
+    def matmul(self, other):
+        return matmul(self, other)
 
-matmul_kernel_code = """
-__kernel void matmul_kernel(__global const float *A, __global const float *B, __global float *C, const int N) {
-    int row = get_global_id(0);
-    int col = get_global_id(1);
-    float sum = 0.0f;
+    def transpose(self):
+        # TODO: This is currently for 2D tensor
+        if self.data.ndim != 2:
+            raise ValueError("transpose currently supports 2D matrices only.")
+        transposed_data = np.transpose(self.data)
 
-    for (int k = 0; k < N; ++k) {
-        sum += A[row * N + k] * B[k * N + col];
-    }
-    C[row * N + col] = sum;
-}
-"""
+        return Tensor(transposed_data, requires_grad=self.requires_grad)
 
 
-# Compile kernels
-try:
-    add_program = cl.Program(context, add_kernel_code).build(options='-w')
-    multiply_program = cl.Program(context, multiply_kernel_code).build(options='-w')
-    subtract_program = cl.Program(context, subtract_kernel_code).build(options='-w')
-    matmul_program = cl.Program(context, matmul_kernel_code).build(options='-w')
-except cl.ProgramBuildFailure as e:
-    print("Build failed:", e)
-except Exception as e:
-    print("An error occurred:", e)
+###############
+# TensorOps
+##############
+# Define generic tensor_operation function
+def tensor_operation(tensor_a: Tensor, tensor_b: Tensor, operation_kernel, is_matmul=False):
+    if is_matmul:
+        # Ensure both tensors are 2D and properly aligned
+        if tensor_a.data.ndim != 2 or tensor_b.data.ndim != 2:
+            raise ValueError("Matmul operation requires both tensors to be 2D matrices.")
+        if tensor_a.data.shape[1] != tensor_b.data.shape[0]:
+            raise ValueError("Matrix multiplication requires shape alignment: a's columns must match b's rows.")
+        N = tensor_a.data.shape[0]  # Number of rows in tensor_a
+        M = tensor_b.data.shape[1]  # Number of columns in tensor_b
+        # Assuming square matrices for simplicity
+        if tensor_a.data.shape[0] != tensor_a.data.shape[1] or tensor_b.data.shape[0] != tensor_b.data.shape[1]:
+            raise ValueError("Matmul currently only supports square matrices.")
+    else:
+        # For element-wise operations, ensure tensors are flattened
+        if tensor_a.data.ndim > 1 or tensor_b.data.ndim > 1:
+            raise ValueError("Element-wise operations currently only support 1D tensors.")
+        N = tensor_a.data.size // 4  # Assuming float4
 
-
-####################
-### Ops
-###################
-
-# Operations using memory pooling
-def operate_with_pooling(tensor_a, tensor_b, operation_kernel, program):
-    num_elements = tensor_a.data.size // 4
-    size = tensor_a.data.nbytes
-    a_buf = memory_pool.allocate(context, size)
-    b_buf = memory_pool.allocate(context, size)
-    c_buf = memory_pool.allocate(context, size)
-
-    # Fill buffers
-    cl.enqueue_copy(queue, a_buf, tensor_a.data.view(np.float32))
-    cl.enqueue_copy(queue, b_buf, tensor_b.data.view(np.float32))
-    operation_kernel(queue, (num_elements,), None, a_buf, b_buf, c_buf, np.int32(num_elements))
-    result = Tensor(np.zeros_like(tensor_a.data), requires_grad=tensor_a.requires_grad or tensor_b.requires_grad)
-
-    cl.enqueue_copy(queue, result.data.view(np.float32), c_buf).wait()
-    
-    memory_pool.free(a_buf)
-    memory_pool.free(b_buf)
-    memory_pool.free(c_buf)
-
-    return result
-
-# Operations
-def add(tensor_a, tensor_b):
-    assert tensor_a.data.shape == tensor_b.data.shape, "Shapes must match"
-    return operate_with_pooling(tensor_a, tensor_b, add_program.add_kernel, tensor_a.data.size // 4)
-
-def multiply(tensor_a, tensor_b):
-    assert tensor_a.data.shape == tensor_b.data.shape, "Shapes must match"
-    return operate_with_pooling(tensor_a, tensor_b, multiply_program.multiply_kernel, tensor_a.data.size // 4)
-
-def subtract(tensor_a, tensor_b):
-    assert tensor_a.data.shape == tensor_b.data.shape, "Shapes must match"
-    return operate_with_pooling(tensor_a, tensor_b, subtract_program.subtract_kernel, tensor_a.data.size // 4)
-
-def matmul(tensor_a, tensor_b):
-    # Assume both tensors are square matrices
-    N = int(np.sqrt(tensor_a.data.size))
-    assert tensor_a.data.size == tensor_b.data.size, "Tensors must be square matrices of the same size"
-    assert N * N == tensor_a.data.size, "Tensor size must be a perfect square"
-
-    # Allocate result tensor and buffers
-    result = Tensor(np.zeros_like(tensor_a.data), requires_grad=tensor_a.requires_grad or tensor_b.requires_grad)
+    result_data = np.empty_like(tensor_a.data)
     a_buf = memory_pool.allocate(context, tensor_a.data.nbytes)
     b_buf = memory_pool.allocate(context, tensor_b.data.nbytes)
-    c_buf = memory_pool.allocate(context, result.data.nbytes)
+    c_buf = memory_pool.allocate(context, result_data.nbytes)
 
-    # Copy data to buffers
-    cl.enqueue_copy(queue, a_buf, tensor_a.data)
-    cl.enqueue_copy(queue, b_buf, tensor_b.data)
+    cl.enqueue_copy(queue, a_buf, tensor_a.data).wait()
+    cl.enqueue_copy(queue, b_buf, tensor_b.data).wait()
 
-    # Execute kernel with 2D global size
-    global_size = (N, N)
-    matmul_program.matmul_kernel(queue, global_size, None, a_buf, b_buf, c_buf, np.int32(N))
+    if is_matmul:
+        global_size = (N, N)
+        operation_kernel(queue, global_size, None, a_buf, b_buf, c_buf, np.int32(N))
+    else:
+        operation_kernel(queue, (N,), None, a_buf, b_buf, c_buf, np.int32(N))
 
-    # Copy result back to host
-    cl.enqueue_copy(queue, result.data, c_buf).wait()
-
-    # Free buffers
+    cl.enqueue_copy(queue, result_data, c_buf).wait()
     memory_pool.free(a_buf)
     memory_pool.free(b_buf)
     memory_pool.free(c_buf)
 
+    result = Tensor(result_data, requires_grad=tensor_a.requires_grad or tensor_b.requires_grad)
+
     return result
+
+class Operation:
+    def __init__(self):
+        self.tensors = []
+        self.grad_fn = None
+
+    def forward(self, *args):
+        raise NotImplementedError
+
+    def backward(self, grad_output):
+        raise NotImplementedError
+
+class AddOperation(Operation):
+    def forward(self, a, b):
+        self.tensors = [a, b]
+        result = tensor_operation(a, b, add_program.add_kernel)
+        result.creator = self
+        return result
+
+    def backward(self, grad_output):
+        a, b = self.tensors
+        if a.requires_grad:
+            a.backward(grad_output)  # Gradient of addition wrt a is 1
+        if b.requires_grad:
+            b.backward(grad_output)  # Gradient of addition wrt b is 1
+
+class MultiplyOperation(Operation):
+    def forward(self, a, b):
+        self.tensors = [a, b]
+        result = tensor_operation(a, b, multiply_program.multiply_kernel)
+        result.creator = self
+        return result
+
+    def backward(self, grad_output):
+        a, b = self.tensors
+        if a.requires_grad:
+            # Gradient of a with respect to d = a * b is b
+            a_grad = grad_output * b.data
+            a.backward(a_grad)
+        if b.requires_grad:
+            # Gradient of b with respect to d = a * b is a
+            b_grad = grad_output * a.data
+            b.backward(b_grad)
+
+class SubtractOperation(Operation):
+    def forward(self, a, b):
+        self.tensors = [a, b]
+        result = tensor_operation(a, b, subtract_program.subtract_kernel)
+        result.creator = self
+        return result
+
+    def backward(self, grad_output):
+        a, b = self.tensors
+        if a.requires_grad:
+            # Gradient of a with respect to c = a - b is 1
+            a.backward(grad_output)
+        if b.requires_grad:
+            # Gradient of b with respect to c = a - b is -1
+            b.backward(-grad_output)
+
+class MatmulOperation(Operation):
+    def forward(self, a, b):
+        if a.data.ndim != 2 or b.data.ndim != 2:
+            raise ValueError("Matmul operation requires both tensors to be 2D matrices.")
+        if a.data.shape[1] != b.data.shape[0]:
+            raise ValueError("Matrix multiplication requires shape alignment: a's columns must match b's rows.")
+        self.tensors = [a, b]
+        result = tensor_operation(a, b, matmul_program.matmul_kernel, is_matmul=True)
+        result.creator = self
+        return result
+
+    def backward(self, grad_output):
+        a, b = self.tensors
+        if a.requires_grad:
+            # Gradient of a with respect to d = a @ b is grad_output @ b^T
+            grad_a = matmul(Tensor(grad_output), b.transpose())
+            a.backward(grad_a.data)
+        if b.requires_grad:
+            # Gradient of b with respect to d = a @ b is a^T @ grad_output
+            grad_b = matmul(a.transpose(), Tensor(grad_output))
+            b.backward(grad_b.data)
+
+
+
+def multiply(a, b):
+    op = MultiplyOperation()
+
+    return op.forward(a, b)
+
+def subtract(a, b):
+    op = SubtractOperation()
+
+    return op.forward(a, b)
+
+def matmul(a, b):
+    op = MatmulOperation()
+
+    return op.forward(a, b)
+
+def add(a, b):
+    op = AddOperation()
+
+    return op.forward(a, b)
+
+
