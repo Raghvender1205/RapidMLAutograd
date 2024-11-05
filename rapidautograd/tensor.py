@@ -10,7 +10,7 @@ warnings.filterwarnings("ignore")
 os.environ['PYOPENCL_COMPILER_OUTPUT'] = '1'
 os.environ["PYOPENCL_CTX"] = "0"
 
-memorypool = MemoryPool()
+memory_pool = MemoryPool()
 
 class Tensor:
     def __init__(self, data, requires_grad=False):
@@ -112,9 +112,9 @@ except Exception as e:
 def operate_with_pooling(tensor_a, tensor_b, operation_kernel, program):
     num_elements = tensor_a.data.size // 4
     size = tensor_a.data.nbytes
-    a_buf = memorypool.allocate(context, size)
-    b_buf = memorypool.allocate(context, size)
-    c_buf = memorypool.allocate(context, size)
+    a_buf = memory_pool.allocate(context, size)
+    b_buf = memory_pool.allocate(context, size)
+    c_buf = memory_pool.allocate(context, size)
 
     # Fill buffers
     cl.enqueue_copy(queue, a_buf, tensor_a.data.view(np.float32))
@@ -124,9 +124,9 @@ def operate_with_pooling(tensor_a, tensor_b, operation_kernel, program):
 
     cl.enqueue_copy(queue, result.data.view(np.float32), c_buf).wait()
     
-    memorypool.free(a_buf)
-    memorypool.free(b_buf)
-    memorypool.free(c_buf)
+    memory_pool.free(a_buf)
+    memory_pool.free(b_buf)
+    memory_pool.free(c_buf)
 
     return result
 
@@ -151,9 +151,9 @@ def matmul(tensor_a, tensor_b):
 
     # Allocate result tensor and buffers
     result = Tensor(np.zeros_like(tensor_a.data), requires_grad=tensor_a.requires_grad or tensor_b.requires_grad)
-    a_buf = memorypool.allocate(context, tensor_a.data.nbytes)
-    b_buf = memorypool.allocate(context, tensor_b.data.nbytes)
-    c_buf = memorypool.allocate(context, result.data.nbytes)
+    a_buf = memory_pool.allocate(context, tensor_a.data.nbytes)
+    b_buf = memory_pool.allocate(context, tensor_b.data.nbytes)
+    c_buf = memory_pool.allocate(context, result.data.nbytes)
 
     # Copy data to buffers
     cl.enqueue_copy(queue, a_buf, tensor_a.data)
@@ -167,8 +167,8 @@ def matmul(tensor_a, tensor_b):
     cl.enqueue_copy(queue, result.data, c_buf).wait()
 
     # Free buffers
-    memorypool.free(a_buf)
-    memorypool.free(b_buf)
-    memorypool.free(c_buf)
+    memory_pool.free(a_buf)
+    memory_pool.free(b_buf)
+    memory_pool.free(c_buf)
 
     return result
