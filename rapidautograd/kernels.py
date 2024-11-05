@@ -1,7 +1,7 @@
 import os
 import pyopencl as cl
 
-os.environ["PYOPENCL_CTX"] = '0'
+os.environ["PYOPENCL_CTX"] = "0"
 
 
 add_kernel_code = """
@@ -50,10 +50,10 @@ queue = cl.CommandQueue(context)
 
 # Compile kernels
 try:
-    add_program = cl.Program(context, add_kernel_code).build(options='-w')
-    multiply_program = cl.Program(context, multiply_kernel_code).build(options='-w')
-    subtract_program = cl.Program(context, subtract_kernel_code).build(options='-w')
-    matmul_program = cl.Program(context, matmul_kernel_code).build(options='-w')
+    add_program = cl.Program(context, add_kernel_code).build(options="-w")
+    multiply_program = cl.Program(context, multiply_kernel_code).build(options="-w")
+    subtract_program = cl.Program(context, subtract_kernel_code).build(options="-w")
+    matmul_program = cl.Program(context, matmul_kernel_code).build(options="-w")
 except cl.Error as e:
     print("Build failed:", e)
 except Exception as e:

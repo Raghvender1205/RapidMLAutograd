@@ -1,16 +1,26 @@
 import numpy as np
 import pyopencl as cl
 from rapidautograd.memorypool import MemoryPool
-from rapidautograd.kernels import add_program, subtract_program, matmul_program, multiply_program, context, queue
+from rapidautograd.kernels import (
+    add_program,
+    subtract_program,
+    matmul_program,
+    multiply_program,
+    context,
+    queue,
+)
 
 memory_pool = MemoryPool()
+
 
 class Tensor:
     def __init__(self, data, requires_grad=False):
         self.data = np.array(data, dtype=np.float32)
         if self.data.size % 4 != 0:
             padding = 4 - self.data.size % 4
-            self.data = np.pad(self.data, (0, padding), 'constant', constant_values=(0,))
+            self.data = np.pad(
+                self.data, (0, padding), "constant", constant_values=(0,)
+            )
         self.requires_grad = requires_grad
         self.grad = None
         self.creator = None
@@ -32,7 +42,7 @@ class Tensor:
         self.grad = None
 
     def __repr__(self):
-        return f'Tensor(data={self.data}, grad={self.grad})'
+        return f"Tensor(data={self.data}, grad={self.grad})"
 
     def add(self, other):
         return add(self, other)
@@ -47,11 +57,10 @@ class Tensor:
         return matmul(self, other)
 
     def transpose(self):
-        # TODO: This is currently for 2D tensor
+        # This implementation assumes a 2D tensor for simplicity.
         if self.data.ndim != 2:
             raise ValueError("transpose currently supports 2D matrices only.")
         transposed_data = np.transpose(self.data)
-
         return Tensor(transposed_data, requires_grad=self.requires_grad)
 
 
@@ -59,22 +68,33 @@ class Tensor:
 # TensorOps
 ##############
 # Define generic tensor_operation function
-def tensor_operation(tensor_a: Tensor, tensor_b: Tensor, operation_kernel, is_matmul=False):
+def tensor_operation(
+    tensor_a: Tensor, tensor_b: Tensor, operation_kernel, is_matmul=False
+):
     if is_matmul:
         # Ensure both tensors are 2D and properly aligned
         if tensor_a.data.ndim != 2 or tensor_b.data.ndim != 2:
-            raise ValueError("Matmul operation requires both tensors to be 2D matrices.")
+            raise ValueError(
+                "Matmul operation requires both tensors to be 2D matrices."
+            )
         if tensor_a.data.shape[1] != tensor_b.data.shape[0]:
-            raise ValueError("Matrix multiplication requires shape alignment: a's columns must match b's rows.")
+            raise ValueError(
+                "Matrix multiplication requires shape alignment: a's columns must match b's rows."
+            )
         N = tensor_a.data.shape[0]  # Number of rows in tensor_a
         M = tensor_b.data.shape[1]  # Number of columns in tensor_b
         # Assuming square matrices for simplicity
-        if tensor_a.data.shape[0] != tensor_a.data.shape[1] or tensor_b.data.shape[0] != tensor_b.data.shape[1]:
+        if (
+            tensor_a.data.shape[0] != tensor_a.data.shape[1]
+            or tensor_b.data.shape[0] != tensor_b.data.shape[1]
+        ):
             raise ValueError("Matmul currently only supports square matrices.")
     else:
         # For element-wise operations, ensure tensors are flattened
         if tensor_a.data.ndim > 1 or tensor_b.data.ndim > 1:
-            raise ValueError("Element-wise operations currently only support 1D tensors.")
+            raise ValueError(
+                "Element-wise operations currently only support 1D tensors."
+            )
         N = tensor_a.data.size // 4  # Assuming float4
 
     result_data = np.empty_like(tensor_a.data)
@@ -96,9 +116,12 @@ def tensor_operation(tensor_a: Tensor, tensor_b: Tensor, operation_kernel, is_ma
     memory_pool.free(b_buf)
     memory_pool.free(c_buf)
 
-    result = Tensor(result_data, requires_grad=tensor_a.requires_grad or tensor_b.requires_grad)
+    result = Tensor(
+        result_data, requires_grad=tensor_a.requires_grad or tensor_b.requires_grad
+    )
 
     return result
+
 
 class Operation:
     def __init__(self):
@@ -110,6 +133,7 @@ class Operation:
 
     def backward(self, grad_output):
         raise NotImplementedError
+
 
 class AddOperation(Operation):
     def forward(self, a, b):
@@ -124,6 +148,7 @@ class AddOperation(Operation):
             a.backward(grad_output)  # Gradient of addition wrt a is 1
         if b.requires_grad:
             b.backward(grad_output)  # Gradient of addition wrt b is 1
+
 
 class MultiplyOperation(Operation):
     def forward(self, a, b):
@@ -143,6 +168,7 @@ class MultiplyOperation(Operation):
             b_grad = grad_output * a.data
             b.backward(b_grad)
 
+
 class SubtractOperation(Operation):
     def forward(self, a, b):
         self.tensors = [a, b]
@@ -159,12 +185,17 @@ class SubtractOperation(Operation):
             # Gradient of b with respect to c = a - b is -1
             b.backward(-grad_output)
 
+
 class MatmulOperation(Operation):
     def forward(self, a, b):
         if a.data.ndim != 2 or b.data.ndim != 2:
-            raise ValueError("Matmul operation requires both tensors to be 2D matrices.")
+            raise ValueError(
+                "Matmul operation requires both tensors to be 2D matrices."
+            )
         if a.data.shape[1] != b.data.shape[0]:
-            raise ValueError("Matrix multiplication requires shape alignment: a's columns must match b's rows.")
+            raise ValueError(
+                "Matrix multiplication requires shape alignment: a's columns must match b's rows."
+            )
         self.tensors = [a, b]
         result = tensor_operation(a, b, matmul_program.matmul_kernel, is_matmul=True)
         result.creator = self
@@ -173,34 +204,30 @@ class MatmulOperation(Operation):
     def backward(self, grad_output):
         a, b = self.tensors
         if a.requires_grad:
-            # Gradient of a with respect to d = a @ b is grad_output @ b^T
-            grad_a = matmul(Tensor(grad_output), b.transpose())
-            a.backward(grad_a.data)
+            # Compute grad_a using numpy's matmul directly
+            grad_a = np.matmul(grad_output, b.data.T)
+            a.backward(grad_a)
         if b.requires_grad:
-            # Gradient of b with respect to d = a @ b is a^T @ grad_output
-            grad_b = matmul(a.transpose(), Tensor(grad_output))
-            b.backward(grad_b.data)
+            # Compute grad_b using numpy's matmul directly
+            grad_b = np.matmul(a.data.T, grad_output)
+            b.backward(grad_b)
 
+
+def add(a, b):
+    op = AddOperation()
+    return op.forward(a, b)
 
 
 def multiply(a, b):
     op = MultiplyOperation()
-
     return op.forward(a, b)
+
 
 def subtract(a, b):
     op = SubtractOperation()
-
     return op.forward(a, b)
+
 
 def matmul(a, b):
     op = MatmulOperation()
-
     return op.forward(a, b)
-
-def add(a, b):
-    op = AddOperation()
-
-    return op.forward(a, b)
-
-
