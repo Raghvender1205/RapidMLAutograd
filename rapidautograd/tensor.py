@@ -1,3 +1,5 @@
+# tensor.py
+
 import numpy as np
 import pyopencl as cl
 from rapidautograd.memorypool import MemoryPool
@@ -16,11 +18,7 @@ memory_pool = MemoryPool()
 class Tensor:
     def __init__(self, data, requires_grad=False):
         self.data = np.array(data, dtype=np.float32)
-        if self.data.size % 4 != 0:
-            padding = 4 - self.data.size % 4
-            self.data = np.pad(
-                self.data, (0, padding), "constant", constant_values=(0,)
-            )
+        self.shape = self.data.shape
         self.requires_grad = requires_grad
         self.grad = None
         self.creator = None
@@ -57,17 +55,12 @@ class Tensor:
         return matmul(self, other)
 
     def transpose(self):
-        # This implementation assumes a 2D tensor for simplicity.
-        if self.data.ndim != 2:
-            raise ValueError("transpose currently supports 2D matrices only.")
-        transposed_data = np.transpose(self.data)
-        return Tensor(transposed_data, requires_grad=self.requires_grad)
+        return Tensor(self.data.T, requires_grad=self.requires_grad)
 
 
 ###############
 # TensorOps
 ##############
-# Define generic tensor_operation function
 def tensor_operation(
     tensor_a: Tensor, tensor_b: Tensor, operation_kernel, is_matmul=False
 ):
@@ -81,46 +74,88 @@ def tensor_operation(
             raise ValueError(
                 "Matrix multiplication requires shape alignment: a's columns must match b's rows."
             )
-        N = tensor_a.data.shape[0]  # Number of rows in tensor_a
-        M = tensor_b.data.shape[1]  # Number of columns in tensor_b
-        # Assuming square matrices for simplicity
-        if (
-            tensor_a.data.shape[0] != tensor_a.data.shape[1]
-            or tensor_b.data.shape[0] != tensor_b.data.shape[1]
-        ):
-            raise ValueError("Matmul currently only supports square matrices.")
+        # Prepare data for OpenCL
+        data_a = tensor_a.data.astype(np.float32)
+        data_b = tensor_b.data.astype(np.float32)
+        result_shape = (tensor_a.data.shape[0], tensor_b.data.shape[1])
+        result_data = np.empty(result_shape, dtype=np.float32)
+
+        # Create buffers
+        mf = cl.mem_flags
+        a_buf = cl.Buffer(
+            context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=data_a
+        )
+        b_buf = cl.Buffer(
+            context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=data_b
+        )
+        c_buf = cl.Buffer(context, mf.WRITE_ONLY, result_data.nbytes)
+
+        # Set kernel arguments and execute
+        N = np.int32(tensor_a.data.shape[0])
+        M = np.int32(tensor_b.data.shape[1])
+        K = np.int32(tensor_a.data.shape[1])  # same as tensor_b.data.shape[0]
+
+        matmul_kernel = operation_kernel.matmul_kernel
+        matmul_kernel.set_args(a_buf, b_buf, c_buf, N, M, K)
+        global_size = (N, M)
+        cl.enqueue_nd_range_kernel(queue, matmul_kernel, global_size, None)
+
+        # Read the result
+        cl.enqueue_copy(queue, result_data, c_buf).wait()
+
+        # Release buffers
+        a_buf.release()
+        b_buf.release()
+        c_buf.release()
+
+        result = Tensor(
+            result_data,
+            requires_grad=tensor_a.requires_grad or tensor_b.requires_grad,
+        )
+        return result
     else:
-        # For element-wise operations, ensure tensors are flattened
-        if tensor_a.data.ndim > 1 or tensor_b.data.ndim > 1:
-            raise ValueError(
-                "Element-wise operations currently only support 1D tensors."
-            )
-        N = tensor_a.data.size // 4  # Assuming float4
+        # Compute broadcasted shape
+        broadcasted_shape = np.broadcast_shapes(tensor_a.shape, tensor_b.shape)
+        # Broadcast data to the same shape
+        data_a = np.broadcast_to(tensor_a.data, broadcasted_shape).astype(
+            np.float32
+        )
+        data_b = np.broadcast_to(tensor_b.data, broadcasted_shape).astype(
+            np.float32
+        )
+        # Flatten the data for OpenCL
+        data_a_flat = data_a.flatten()
+        data_b_flat = data_b.flatten()
+        result_data_flat = np.empty_like(data_a_flat)
 
-    result_data = np.empty_like(tensor_a.data)
-    a_buf = memory_pool.allocate(context, tensor_a.data.nbytes)
-    b_buf = memory_pool.allocate(context, tensor_b.data.nbytes)
-    c_buf = memory_pool.allocate(context, result_data.nbytes)
+        # Create buffers
+        mf = cl.mem_flags
+        a_buf = cl.Buffer(
+            context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=data_a_flat
+        )
+        b_buf = cl.Buffer(
+            context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=data_b_flat
+        )
+        c_buf = cl.Buffer(context, mf.WRITE_ONLY, data_a_flat.nbytes)
 
-    cl.enqueue_copy(queue, a_buf, tensor_a.data).wait()
-    cl.enqueue_copy(queue, b_buf, tensor_b.data).wait()
+        # Execute the kernel
+        global_size = (data_a_flat.size,)
+        operation_kernel(queue, global_size, None, a_buf, b_buf, c_buf, np.int32(data_a_flat.size))
 
-    if is_matmul:
-        global_size = (N, N)
-        operation_kernel(queue, global_size, None, a_buf, b_buf, c_buf, np.int32(N))
-    else:
-        operation_kernel(queue, (N,), None, a_buf, b_buf, c_buf, np.int32(N))
+        # Read the result
+        cl.enqueue_copy(queue, result_data_flat, c_buf).wait()
+        result_data = result_data_flat.reshape(broadcasted_shape)
 
-    cl.enqueue_copy(queue, result_data, c_buf).wait()
-    memory_pool.free(a_buf)
-    memory_pool.free(b_buf)
-    memory_pool.free(c_buf)
+        # Release buffers
+        a_buf.release()
+        b_buf.release()
+        c_buf.release()
 
-    result = Tensor(
-        result_data, requires_grad=tensor_a.requires_grad or tensor_b.requires_grad
-    )
-
-    return result
+        result = Tensor(
+            result_data,
+            requires_grad=tensor_a.requires_grad or tensor_b.requires_grad,
+        )
+        return result
 
 
 class Operation:
@@ -135,6 +170,16 @@ class Operation:
         raise NotImplementedError
 
 
+def unbroadcast(grad, shape):
+    # Sum grad over axes where shape is 1 (broadcasted dimensions)
+    while len(grad.shape) > len(shape):
+        grad = grad.sum(axis=0)
+    for i, dim in enumerate(shape):
+        if dim == 1:
+            grad = grad.sum(axis=i, keepdims=True)
+    return grad
+
+
 class AddOperation(Operation):
     def forward(self, a, b):
         self.tensors = [a, b]
@@ -145,9 +190,11 @@ class AddOperation(Operation):
     def backward(self, grad_output):
         a, b = self.tensors
         if a.requires_grad:
-            a.backward(grad_output)  # Gradient of addition wrt a is 1
+            grad_a = unbroadcast(grad_output, a.shape)
+            a.backward(grad_a)
         if b.requires_grad:
-            b.backward(grad_output)  # Gradient of addition wrt b is 1
+            grad_b = unbroadcast(grad_output, b.shape)
+            b.backward(grad_b)
 
 
 class MultiplyOperation(Operation):
@@ -160,13 +207,13 @@ class MultiplyOperation(Operation):
     def backward(self, grad_output):
         a, b = self.tensors
         if a.requires_grad:
-            # Gradient of a with respect to d = a * b is b
-            a_grad = grad_output * b.data
-            a.backward(a_grad)
+            grad_a = grad_output * b.data
+            grad_a = unbroadcast(grad_a, a.shape)
+            a.backward(grad_a)
         if b.requires_grad:
-            # Gradient of b with respect to d = a * b is a
-            b_grad = grad_output * a.data
-            b.backward(b_grad)
+            grad_b = grad_output * a.data
+            grad_b = unbroadcast(grad_b, b.shape)
+            b.backward(grad_b)
 
 
 class SubtractOperation(Operation):
@@ -179,36 +226,26 @@ class SubtractOperation(Operation):
     def backward(self, grad_output):
         a, b = self.tensors
         if a.requires_grad:
-            # Gradient of a with respect to c = a - b is 1
-            a.backward(grad_output)
+            grad_a = unbroadcast(grad_output, a.shape)
+            a.backward(grad_a)
         if b.requires_grad:
-            # Gradient of b with respect to c = a - b is -1
-            b.backward(-grad_output)
+            grad_b = unbroadcast(-grad_output, b.shape)
+            b.backward(grad_b)
 
 
 class MatmulOperation(Operation):
     def forward(self, a, b):
-        if a.data.ndim != 2 or b.data.ndim != 2:
-            raise ValueError(
-                "Matmul operation requires both tensors to be 2D matrices."
-            )
-        if a.data.shape[1] != b.data.shape[0]:
-            raise ValueError(
-                "Matrix multiplication requires shape alignment: a's columns must match b's rows."
-            )
         self.tensors = [a, b]
-        result = tensor_operation(a, b, matmul_program.matmul_kernel, is_matmul=True)
+        result = tensor_operation(a, b, matmul_program, is_matmul=True)
         result.creator = self
         return result
 
     def backward(self, grad_output):
         a, b = self.tensors
         if a.requires_grad:
-            # Compute grad_a using numpy's matmul directly
             grad_a = np.matmul(grad_output, b.data.T)
             a.backward(grad_a)
         if b.requires_grad:
-            # Compute grad_b using numpy's matmul directly
             grad_b = np.matmul(a.data.T, grad_output)
             b.backward(grad_b)
 

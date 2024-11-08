@@ -5,7 +5,7 @@ os.environ["PYOPENCL_CTX"] = "0"
 
 
 add_kernel_code = """
-__kernel void add_kernel(__global const float4 *a, __global const float4 *b, __global float4 *c, int num_elements) {
+__kernel void add_kernel(__global const float *a, __global const float *b, __global float *c, int num_elements) {
     int idx = get_global_id(0);
     if (idx < num_elements) {
         c[idx] = a[idx] + b[idx];
@@ -14,7 +14,7 @@ __kernel void add_kernel(__global const float4 *a, __global const float4 *b, __g
 """
 
 multiply_kernel_code = """
-__kernel void multiply_kernel(__global const float4 *a, __global const float4 *b, __global float4 *c, int num_elements) {
+__kernel void multiply_kernel(__global const float *a, __global const float *b, __global float *c, int num_elements) {
     int idx = get_global_id(0);
     if (idx < num_elements) {
         c[idx] = a[idx] * b[idx];
@@ -23,7 +23,7 @@ __kernel void multiply_kernel(__global const float4 *a, __global const float4 *b
 """
 
 subtract_kernel_code = """
-__kernel void subtract_kernel(__global const float4 *a, __global const float4 *b, __global float4 *c, int num_elements) {
+__kernel void subtract_kernel(__global const float *a, __global const float *b, __global float *c, int num_elements) {
     int idx = get_global_id(0);
     if (idx < num_elements) {
         c[idx] = a[idx] - b[idx];
@@ -32,15 +32,22 @@ __kernel void subtract_kernel(__global const float4 *a, __global const float4 *b
 """
 
 matmul_kernel_code = """
-__kernel void matmul_kernel(__global const float *A, __global const float *B, __global float *C, const int N) {
+__kernel void matmul_kernel(
+    __global const float *A,
+    __global const float *B,
+    __global float *C,
+    const int N,
+    const int M,
+    const int K) {
     int row = get_global_id(0);
     int col = get_global_id(1);
-    float sum = 0.0f;
-
-    for (int k = 0; k < N; ++k) {
-        sum += A[row * N + k] * B[k * N + col];
+    if (row < N && col < M) {
+        float sum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            sum += A[row * K + k] * B[k * M + col];
+        }
+        C[row * M + col] = sum;
     }
-    C[row * N + col] = sum;
 }
 """
 
