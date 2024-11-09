@@ -2,6 +2,8 @@
 
 import numpy as np
 import pyopencl as cl
+from sympy.sets.sets import set_function
+
 from rapidautograd.memorypool import MemoryPool
 from rapidautograd.kernels import (
     add_program,
@@ -57,10 +59,36 @@ class Tensor:
     def transpose(self):
         return Tensor(self.data.T, requires_grad=self.requires_grad)
 
+    def sum(self, axis=None, keepdims=False):
+        return sum(self, axis=axis, keepdims=keepdims)
+
+    def mean(self, axis=None, keepdims=False):
+        return mean(self, axis=axis, keepdims=keepdims)
+
+    def max(self, axis=None, keepdims=False):
+        return max(self, axis=axis, keepdims=keepdims)
+
+    def min(self, axis=None, keepdims=False):
+        return min(self, axis=axis, keepdims=keepdims)
 
 ###############
 # TensorOps
 ##############
+
+class Operation:
+    """
+    Base Operation
+    """
+    def __init__(self):
+        self.tensors = []
+        self.grad_fn = None
+
+    def forward(self, *args):
+        raise NotImplementedError
+
+    def backward(self, grad_output):
+        raise NotImplementedError
+
 def tensor_operation(
     tensor_a: Tensor, tensor_b: Tensor, operation_kernel, is_matmul=False
 ):
@@ -155,19 +183,8 @@ def tensor_operation(
             result_data,
             requires_grad=tensor_a.requires_grad or tensor_b.requires_grad,
         )
+
         return result
-
-
-class Operation:
-    def __init__(self):
-        self.tensors = []
-        self.grad_fn = None
-
-    def forward(self, *args):
-        raise NotImplementedError
-
-    def backward(self, grad_output):
-        raise NotImplementedError
 
 
 def unbroadcast(grad, shape):
@@ -177,6 +194,7 @@ def unbroadcast(grad, shape):
     for i, dim in enumerate(shape):
         if dim == 1:
             grad = grad.sum(axis=i, keepdims=True)
+
     return grad
 
 
@@ -202,6 +220,7 @@ class MultiplyOperation(Operation):
         self.tensors = [a, b]
         result = tensor_operation(a, b, multiply_program.multiply_kernel)
         result.creator = self
+
         return result
 
     def backward(self, grad_output):
@@ -221,6 +240,7 @@ class SubtractOperation(Operation):
         self.tensors = [a, b]
         result = tensor_operation(a, b, subtract_program.subtract_kernel)
         result.creator = self
+
         return result
 
     def backward(self, grad_output):
@@ -238,6 +258,7 @@ class MatmulOperation(Operation):
         self.tensors = [a, b]
         result = tensor_operation(a, b, matmul_program, is_matmul=True)
         result.creator = self
+
         return result
 
     def backward(self, grad_output):
@@ -252,19 +273,157 @@ class MatmulOperation(Operation):
 
 def add(a, b):
     op = AddOperation()
+
     return op.forward(a, b)
 
 
 def multiply(a, b):
     op = MultiplyOperation()
+
     return op.forward(a, b)
 
 
 def subtract(a, b):
     op = SubtractOperation()
+
     return op.forward(a, b)
 
 
 def matmul(a, b):
     op = MatmulOperation()
+
     return op.forward(a, b)
+
+#############
+# ReduceOps
+#############
+
+class SumOperation(Operation):
+    def __init__(self, axis=None, keepdims=False):
+        super().__init__()
+        self.axis = axis
+        self.keepdims = keepdims
+
+    def forward(self, a):
+        self.tensors = [a]
+        result_data = a.data.sum(axis=self.axis, keepdims=self.keepdims)
+        result = Tensor(result_data, requires_grad=a.requires_grad)
+        result.creator = self
+
+        return result
+
+    def backward(self, grad_output):
+        a = self.tensors[0]
+        if a.requires_grad:
+            grad_input = grad_output
+            if self.axis is not None:
+                shape = list(a.shape)
+                if not self.keepdims:
+                    for ax in sorted((self.axis,) if isinstance(self.axis, int) else self.axis):
+                        shape[ax] = 1
+                grad_input = grad_output.reshape(shape)
+            grad_input = np.broadcast_to(grad_input, a.shape)
+            a.backward(grad_input)
+
+class MeanOperation(Operation):
+    def __init__(self, axis=None, keepdims=False):
+        super().__init__()
+        self.axis = axis
+        self.keepdims = keepdims
+
+    def forward(self, a):
+        self.tensors = [a]
+        self.input_shape = a.shape
+        result_data = a.data.mean(axis=self.axis, keepdims=self.keepdims)
+        self.output_shape = result_data.shape
+        result = Tensor(result_data, requires_grad=a.requires_grad)
+        result.creator = self
+
+        return result
+
+    def backward(self, grad_output):
+        a = self.tensors[0]
+        if a.requires_grad:
+            grad_input = grad_output
+            if self.axis is not None:
+                shape = list(a.shape)
+                if not self.keepdims:
+                    for ax in sorted((self.axis,) if isinstance(self.axis, int) else self.axis):
+                        shape[ax] = 1
+                grad_input = grad_output.reshape(shape)
+            grad_input = np.broadcast_to(grad_input, a.shape) / np.prod(
+                [a.shape[ax] for ax in (self.axis,) if self.axis is not None])
+            a.backward(grad_input)
+
+class MaxOperation(Operation):
+    def __init__(self, axis=None, keepdims=False):
+        super().__init__()
+        self.axis = axis
+        self.keepdims = keepdims
+
+    def forward(self, a):
+        self.tensors = [a]
+        self.a_data = a.data
+        self.result_data = a.data.max(axis=self.axis, keepdims=self.keepdims)
+        result = Tensor(self.result_data, requires_grad=a.requires_grad)
+        result.creator = self
+        return result
+
+    def backward(self, grad_output):
+        a = self.tensors[0]
+        if a.requires_grad:
+            grad_input = np.zeros_like(a.data)
+            mask = (a.data == self.result_data)
+            grad = grad_output
+            if self.axis is not None and not self.keepdims:
+                grad = np.expand_dims(grad, axis=self.axis)
+            grad_input[mask] = grad
+            a.backward(grad_input)
+
+class MinOperation(Operation):
+    def __init__(self, axis=None, keepdims=False):
+        super().__init__()
+        self.axis = axis
+        self.keepdims = keepdims
+
+    def forward(self, a):
+        self.tensors = [a]
+        self.a_data = a.data
+        self.result_data = a.data.min(axis=self.axis, keepdims=self.keepdims)
+        result = Tensor(self.result_data, requires_grad=a.requires_grad)
+        result.creator = self
+        return result
+
+    def backward(self, grad_output):
+        a = self.tensors[0]
+        if a.requires_grad:
+            grad_input = np.zeros_like(a.data)
+            mask = (a.data == self.result_data)
+            grad = grad_output
+            if self.axis is not None and not self.keepdims:
+                grad = np.expand_dims(grad, axis=self.axis)
+            grad_input[mask] = grad
+            a.backward(grad_input)
+
+
+def sum(tensor: Tensor, axis=None, keepdims=True):
+    op = SumOperation(axis=axis, keepdims=keepdims)
+
+    return op.forward(tensor)
+
+def mean(tensor: Tensor, axis=None, keepdims=True):
+    op = MeanOperation(axis=axis, keepdims=keepdims)
+
+    return op.forward(tensor)
+
+def max(tensor: Tensor, axis=None, keepdims=True):
+    op = MaxOperation(axis=axis, keepdims=keepdims)
+
+    return op.forward(tensor)
+
+def min(tensor: Tensor, axis=None, keepdims=True):
+    op = MinOperation(axis=axis, keepdims=keepdims)
+
+    return op.forward(tensor)
+
+
