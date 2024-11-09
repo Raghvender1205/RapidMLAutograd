@@ -1,8 +1,5 @@
-# tensor.py
-
 import numpy as np
 import pyopencl as cl
-from sympy.sets.sets import set_function
 
 from rapidautograd.memorypool import MemoryPool
 from rapidautograd.kernels import (
@@ -24,6 +21,21 @@ class Tensor:
         self.requires_grad = requires_grad
         self.grad = None
         self.creator = None
+
+    def __add__(self, other):
+        return add(self, other)
+
+    def __radd__(self, other):
+        return add(self, other)
+
+    def __sub__(self, other):
+        return subtract(self, other)
+
+    def __mul__(self, other):
+        return multiply(self, other)
+
+    def __matmul__(self, other):
+        return matmul(self, other)
 
     def backward(self, grad=None):
         if not self.requires_grad:
